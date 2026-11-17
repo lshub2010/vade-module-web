@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps
+        run: python -m pip install -U pip pytest
+      - name: Tools tests (no SDK needed)
+        # The tools suite runs entirely against a local http.server with a fake
+        # DNS/transport layer: no network egress, no flaky third-party site.
+        run: python -m pytest tests -q

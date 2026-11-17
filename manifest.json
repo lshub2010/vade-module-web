@@ -1,0 +1,60 @@
+{
+  "capabilities": {
+    "tools": [
+      {
+        "description": "抓取 http/https URL 的文本（仅 text/* 与 application/json）；拒绝内网地址，最多 3 次重定向，超过 max_bytes 截断",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "max_bytes": {
+              "default": 262144,
+              "type": "integer"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        },
+        "name": "web_fetch",
+        "risk": "medium",
+        "timeout_ms": 35000
+      },
+      {
+        "description": "获取 http/https URL 的 HEAD 响应：status/content_type/content_length；同样拒绝内网地址与超限重定向",
+        "idempotent": true,
+        "input_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        },
+        "name": "web_head",
+        "risk": "low",
+        "timeout_ms": 35000
+      }
+    ]
+  },
+  "concurrency": "pooled",
+  "display_name": "Web 模块",
+  "instance_id": "main",
+  "limits": {
+    "max_concurrency": 4,
+    "max_payload": 65519
+  },
+  "module_id": "com.example.web",
+  "priority": 0,
+  "protocol": "vade/v1",
+  "role": "tool",
+  "version": "1.0.0"
+}
