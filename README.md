@@ -11,7 +11,7 @@
 
 | 工具 | 签名 | 结果 | risk | idempotent |
 |---|---|---|---|---|
-| `web_fetch` | `web_fetch(url: str, max_bytes: int = 262144)` | `{status, content_type, text, bytes, truncated, final_url}` | **medium** | true |
+| `web_fetch` | `web_fetch(url: str, max_bytes: int = 32768)` | `{status, content_type, text, bytes, truncated, final_url}` | **medium** | true |
 | `web_head` | `web_head(url: str)` | `{status, content_type, content_length}` | low | true |
 
 **名字为什么是下划线**：SDK 的 `ToolSpec` 只接受 `^[a-z][a-z0-9_]{0,63}$`，`.` 不合法，
@@ -25,8 +25,10 @@
 - `content_type`：解析后的媒体类型，不含 `charset` 参数；服务器没发这个头时为 `null`。
 - `text`：正文按 `charset`（缺省 `utf-8`）解码；无法识别的 charset 回退到 utf-8；
   解码用 `errors="replace"`，一个坏字节不会让整页失败。
-- `bytes`：**实际返回的字节数**（截断后），不是 `Content-Length`。
-- `truncated`：是否因为 `max_bytes` 而截断。
+- `bytes`：**窗口内实际读到的正文字节数**（因 `max_bytes` 截断后），不是 `Content-Length`。
+- `truncated`：`text` 是否不是完整的正文。两种原因都算：`max_bytes` 窗口截断，或
+  整个结果（含 JSON 元数据）超出 `MAX_RESULT_BYTES` 后在这里又切了一刀。后一种情况下
+  `text` 会比 `bytes` 短。
 - `final_url`：跟完重定向后的 URL（已规范化：去掉 fragment、补全 idna、缺省端口不写）。
 - `content_length`（仅 head）：`Content-Length` 头的整数值；缺失或非法 → `null`
   （服务器用 chunked 时很常见）。
@@ -114,14 +116,20 @@ if status in REDIRECT_STATUSES and location:
 
 | 上限 | 值 | 触发 |
 |---|---|---|
-| `max_bytes` 默认 | 256 KiB | —— |
-| `max_bytes` 硬上限 | 1 MiB（`MAX_BYTES_CEILING`） | 越界 → `INVALID_ARGUMENT`（不发起请求） |
+| `max_bytes` 默认 | 32 KiB | —— |
+| 一次结果总预算（`MAX_RESULT_BYTES`） | 48 KiB（49152） | `text` + JSON 元数据超过 → 按字节切 `text`，`truncated=true` |
+| `max_bytes` 硬上限 | 48 KiB（`MAX_BYTES_CEILING`，与结果预算同值） | 越界 → `INVALID_ARGUMENT`（不发起请求） |
 | 单跳 | 10 s（`REQUEST_TIMEOUT_SECONDS`） | 连接与每次 read 都受它约束 |
 | 整次调用 | 30 s（`TOTAL_TIMEOUT_SECONDS`） | 含全部重定向 |
 | 重定向 | 3 次（`MAX_REDIRECTS`） | 超出 → `INVALID_ARGUMENT` |
 
 - 正文只读 `max_bytes + 1` 字节（多读 1 字节只为判断截断），**不信任
   `Content-Length`**：谎报长度的服务器也只能塞给我们一个窗口。
+- **`max_bytes` 管正文，`MAX_RESULT_BYTES` 管结果**，两者不是一回事：JSON 转义
+  （`\n`、引号、控制字符）和多字节文本都会让信封比读到的字节更长，而 transport 还得
+  带上元数据。所以 `text` 解出来之后还会按预算再校一次，超了就用二分法找最长的字符前缀
+  ——按字节预算切，但落点永远在字符边界上，不会切出半个 UTF-8 序列。
+- 预算小于一帧（65519），差额留给 JSON-RPC 信封；`web_fetch` 的任何结果都能装进一帧。
 - 读的时候按 64 KiB 分块，每块之间检查总预算，所以"慢慢挤字节"的服务器也会被 30 s 掐掉，
   而不是让一次调用挂到工具超时。
 - 工具 `timeout_ms=35000`：30 s 预算 + 一跳的余量。
@@ -129,7 +137,7 @@ if status in REDIRECT_STATUSES and location:
 ### 6. 内容类型
 
 只返回 `text/*` 与 `application/json`，其余 `INVALID_ARGUMENT`——而且是在**读正文之前**
-用响应头判断的：下载 256 KiB 图片再扔掉没有意义。
+用响应头判断的：下载 32 KiB 图片再扔掉没有意义。
 
 **没有 `Content-Type` 头也算不合法**。这里有个坑：`email.message.Message.get_content_type()`
 在头缺失时会返回 `text/plain`，等价于把未标注的二进制放行；所以代码先看头在不在
@@ -208,7 +216,7 @@ modules/web/
 pip install -e sdk/python          # 或 pip install "vade-sdk==0.1.*"
 pip install -e modules/web
 
-pytest modules/web/tests -q        # 120 passed（无 core；无 SDK 时 server 测试 skip）
+pytest modules/web/tests -q        # 126 passed（无 core；无 SDK 时 server 测试 skip）
 python -m web_module --check       # exit 0，并把 manifest 打到 stdout
 
 python -m web_module --standalone web_fetch --args '{"url":"https://example.com/","max_bytes":200}'
@@ -235,19 +243,20 @@ CORE_PUBLIC_KEY=<64 hex> MODULE_KEY_PATH=data/module.key \
 
 `concurrency="pooled"`：无状态、只读，多个实例可分担负载。
 
-## Frame ceiling（部署前必读）
+## Frame ceiling（为什么预算是 48 KiB）
 
-v1 传输**没有分片**，一帧明文上限 65519 字节（`FRAME_PLAINTEXT_BYTES`）。本模块本地
-允许 `web_fetch` 返回最多 1 MiB，但超过一帧的结果**发不出去**：transport 会在
-`payload > 65519` 时直接 `PAYLOAD_TOO_LARGE` 并断开（fatal）。
+v1 传输**没有分片**，一帧明文上限 65519 字节（`FRAME_PLAINTEXT_BYTES`），transport 在
+`payload > 65519` 时直接 `PAYLOAD_TOO_LARGE` 并断开（fatal）。一个发不出去的结果等于没有
+结果，所以本模块把**整个结果**（`text` + JSON 元数据）压到 `MAX_RESULT_BYTES = 49152`
+以内：65519 − 49152 = 16367 字节留给 JSON-RPC 信封和 Noise 帧头，绰绰有余。
 
-默认 `max_bytes=262144` 远超一帧，这是本模块最容易踩的部署坑：
+- 默认 `max_bytes=32768`，加上元数据离预算还有 ~16 KiB，默认调用永远不会触发二次截断；
+- `MAX_BYTES_CEILING` 也是 49152：允许读更宽的正文没有意义，反正装不进结果；
+- 如果调用方显式要了 49152 的窗口，`text` 会被预算再切掉几百字节（元数据与转义的开销），
+  这时 `truncated=true`、`text` 比 `bytes` 短——这是正常的，不是 bug；
+- `--standalone` 不经过 transport，但同样受预算约束（`web_fetch` 自己就是那个约束）。
 
-- **对 core 部署时把 `max_bytes` 压到 ~60000**（JSON 包装后还要留余量）；
-- 1 MiB 是本地硬上限（防内存放大），不是"一定能送达"的承诺；
-- `--standalone` 不经过 transport，不受此限。
-
-`bytes` 是实际返回的字节数，`truncated` 是判断"要不要再要一次更小的窗口"的依据。
+`bytes` 是窗口读到的正文字节数，`truncated` 是判断"要不要再要一次更小的窗口"的依据。
 
 ## 容器
 

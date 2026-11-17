@@ -10,7 +10,7 @@ The module's real subject is the boundary, so the tests are organised around it:
   NAT64, multicast, TEST-NET — asserted by code, never by "raises";
 * **redirects**: every hop is re-validated, so a 302 to `http://127.0.0.1/` is
   the headline test of the module;
-* **limits**: `max_bytes` truncation, the 1 MiB ceiling, per-hop timeout, 3 hops.
+* **limits**: `max_bytes` truncation, the result budget, per-hop timeout, 3 hops.
 """
 
 from __future__ import annotations
@@ -96,6 +96,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, "text/plain", "x" * 5000, body=body)
         elif path == "/exact":
             self._send(200, "text/plain", "y" * 64, body=body)
+        elif path.startswith("/pad/"):
+            # A body of exactly N ASCII bytes: the result-budget tests need to
+            # sit one byte either side of the limit.
+            self._send(200, "text/plain", "a" * int(path.rsplit("/", 1)[1]), body=body)
+        elif path.startswith("/cjk/"):
+            # Three-byte characters: a byte-wise cut would split one in half.
+            self._send(200, "text/plain; charset=utf-8", "世" * int(path.rsplit("/", 1)[1]), body=body)
         elif path == "/utf8":
             self._send(200, "text/plain; charset=utf-8", "hello 世界", body=body)
         elif path == "/latin1":
@@ -272,14 +279,18 @@ def test_only_stdlib_is_imported():
 
 
 def test_documented_limits():
-    assert tools.DEFAULT_MAX_BYTES == 262_144
-    assert tools.MAX_BYTES_CEILING == 1024 * 1024
+    assert tools.DEFAULT_MAX_BYTES == 32_768
+    assert tools.MAX_RESULT_BYTES == 49_152
+    assert tools.MAX_BYTES_CEILING == 49_152
+    assert tools.MAX_RESULT_BYTES == tools.MAX_BYTES_CEILING
     assert tools.MAX_REDIRECTS == 3
     assert tools.REQUEST_TIMEOUT_SECONDS == 10.0
     assert tools.TOTAL_TIMEOUT_SECONDS == 30.0
     assert tools.USER_AGENT == "vade-web/1.0"
     assert tools.ALLOWED_SCHEMES == ("http", "https")
     assert tools.FRAME_PLAINTEXT_BYTES == 65_519
+    # The budget must leave room for the JSON-RPC envelope inside one frame.
+    assert tools.DEFAULT_MAX_BYTES < tools.MAX_RESULT_BYTES < tools.FRAME_PLAINTEXT_BYTES
 
 
 def test_every_tool_is_decorated_and_unique():
@@ -673,6 +684,102 @@ def test_max_bytes_ceiling_is_enforced_against_the_constant(server, net, monkeyp
     monkeypatch.setattr(tools, "MAX_BYTES_CEILING", 8)
     _failure("INVALID_ARGUMENT", tools.web_fetch, base(server, "/hello"), max_bytes=9)
     assert tools.web_fetch(base(server, "/hello"), max_bytes=8)["bytes"] == 8
+
+
+# ------------------------------------------------------------------ result budget
+
+
+def _result_bytes(result) -> int:
+    """Independent measurement: the whole result, metadata included, as UTF-8 JSON."""
+    return len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+
+def _pad_result_size(server, text_len: int) -> int:
+    """What `web_fetch` would serialise for `/pad/<text_len>` if left untouched."""
+    return _result_bytes(
+        {
+            "status": 200,
+            "content_type": "text/plain",
+            "text": "a" * text_len,
+            "bytes": text_len,
+            "truncated": False,
+            "final_url": base(server, f"/pad/{text_len}"),
+        }
+    )
+
+
+def _largest_pad_that_fits(server) -> int:
+    """The N whose untouched result is exactly `MAX_RESULT_BYTES` long."""
+    size = tools.MAX_RESULT_BYTES
+    for _ in range(8):
+        size = tools.MAX_RESULT_BYTES - (_pad_result_size(server, size) - size)
+    assert _pad_result_size(server, size) == tools.MAX_RESULT_BYTES
+    return size
+
+
+def test_result_exactly_at_the_budget_is_not_truncated(server, net):
+    size = _largest_pad_that_fits(server)
+    result = tools.web_fetch(base(server, f"/pad/{size}"), max_bytes=size)
+    assert _result_bytes(result) == tools.MAX_RESULT_BYTES
+    assert result["truncated"] is False
+    assert result["bytes"] == size
+    assert len(result["text"]) == size
+
+
+def test_result_one_byte_over_the_budget_is_cut_and_flagged(server, net):
+    size = _largest_pad_that_fits(server) + 2
+    result = tools.web_fetch(base(server, f"/pad/{size}"), max_bytes=size)
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    assert result["truncated"] is True
+    # `bytes` still reports the body window; only `text` was shortened.
+    assert result["bytes"] == size
+    assert len(result["text"]) < size
+    assert result["text"] == "a" * len(result["text"])
+    # Maximal, not merely small: one more character would break the budget.
+    assert _result_bytes({**result, "text": result["text"] + "a"}) > tools.MAX_RESULT_BYTES
+
+
+def test_budget_that_only_the_flag_itself_exceeds_cuts_a_character(server, net):
+    """One byte over is the awkward case: `false` → `true` alone would fit.
+
+    The flag must not be raised over text that is still complete, so a character
+    is dropped and the claim stays true.
+    """
+    size = _largest_pad_that_fits(server) + 1
+    result = tools.web_fetch(base(server, f"/pad/{size}"), max_bytes=size)
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    assert result["truncated"] is True
+    assert len(result["text"]) == size - 1
+    assert result["text"] == "a" * len(result["text"])
+
+
+def test_default_window_result_fits_one_frame(server, net):
+    result = tools.web_fetch(base(server, "/pad/200000"))
+    assert result["bytes"] == tools.DEFAULT_MAX_BYTES
+    assert result["truncated"] is True
+    assert len(result["text"]) == tools.DEFAULT_MAX_BYTES
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    assert _result_bytes(result) < tools.FRAME_PLAINTEXT_BYTES
+
+
+def test_ceiling_sized_body_still_yields_a_sendable_result(server, net):
+    """The widest allowed body plus its metadata no longer fits, so text is cut."""
+    result = tools.web_fetch(base(server, "/pad/200000"), max_bytes=tools.MAX_BYTES_CEILING)
+    assert result["bytes"] == tools.MAX_BYTES_CEILING
+    assert result["truncated"] is True
+    assert _result_bytes(result) <= tools.MAX_RESULT_BYTES
+    assert _result_bytes(result) < tools.FRAME_PLAINTEXT_BYTES
+    assert len(result["text"]) < result["bytes"]
+
+
+def test_result_budget_never_splits_a_utf8_character(server, net, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(tools, "MAX_RESULT_BYTES", 600)
+    result = tools.web_fetch(base(server, "/cjk/500"), max_bytes=1500)
+    assert result["truncated"] is True
+    assert _result_bytes(result) <= 600
+    # A byte-wise cut would leave U+FFFD at the edge; a character-wise one cannot.
+    assert result["text"] == "世" * len(result["text"])
+    assert "\ufffd" not in result["text"]
 
 
 def test_read_timeout_is_unavailable(server, net, monkeypatch: pytest.MonkeyPatch):

@@ -2,13 +2,13 @@
   "capabilities": {
     "tools": [
       {
-        "description": "抓取 http/https URL 的文本（仅 text/* 与 application/json）；拒绝内网地址，最多 3 次重定向，超过 max_bytes 截断",
+        "description": "抓取 http/https URL 的文本（仅 text/* 与 application/json）；拒绝内网地址，最多 3 次重定向；超过 max_bytes 或结果预算 49152 字节截断",
         "idempotent": true,
         "input_schema": {
           "additionalProperties": false,
           "properties": {
             "max_bytes": {
-              "default": 262144,
+              "default": 32768,
               "type": "integer"
             },
             "url": {

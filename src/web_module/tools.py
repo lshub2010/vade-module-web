@@ -27,9 +27,11 @@ hop is re-validated with the same function. That is the difference between
 Everything below is stdlib (`urllib`, `http.client`, `socket`, `ipaddress`) and
 the module never imports `vade_sdk` — see `server.py` for the adapter.
 
-Limits are deliberate and small: `DEFAULT_MAX_BYTES` 256 KiB, hard ceiling 1 MiB,
-10 s per hop, 30 s per call. A tool that can be asked for an unbounded download
-is a tool that can be asked to exhaust the process.
+Limits are deliberate and small: `DEFAULT_MAX_BYTES` 32 KiB, a 48 KiB budget for
+the whole result (`MAX_RESULT_BYTES`, which is also the hard body ceiling), 10 s
+per hop, 30 s per call. A tool that can be asked for an unbounded download is a
+tool that can be asked to exhaust the process — and one whose answer would not
+fit a transport frame anyway.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import errno
 import functools
 import http.client
 import ipaddress
+import json
 import socket
 import time
 import urllib.error
@@ -51,6 +54,7 @@ __all__ = [
     "tool",
     "ToolFailure",
     "DEFAULT_MAX_BYTES",
+    "MAX_RESULT_BYTES",
     "MAX_BYTES_CEILING",
     "MAX_REDIRECTS",
     "REQUEST_TIMEOUT_SECONDS",
@@ -68,10 +72,18 @@ __all__ = [
 
 #: Default body window for `web_fetch`. A model asking to "read a page" wants a
 #: page, not a megabyte of tokens.
-DEFAULT_MAX_BYTES = 262_144
+DEFAULT_MAX_BYTES = 32_768
+
+#: Budget for **one whole result**: `text` plus the JSON metadata around it.
+#: Exceeding it is not a rendering detail — v1 has no fragmentation, so a result
+#: that outgrows `FRAME_PLAINTEXT_BYTES` cannot be sent to core at all. The
+#: budget sits well below the frame so the JSON-RPC envelope still fits.
+MAX_RESULT_BYTES = 49_152
 
 #: Hard ceiling for one response body, independent of the caller's `max_bytes`.
-MAX_BYTES_CEILING = 1024 * 1024
+#: A body wider than the result budget could never be delivered intact, so the
+#: two limits are the same number on purpose.
+MAX_BYTES_CEILING = MAX_RESULT_BYTES
 
 #: Redirect hops we are willing to follow. Each hop is re-validated; a chain
 #: longer than this is refused with `INVALID_ARGUMENT`, not followed blindly.
@@ -98,10 +110,10 @@ ALLOWED_SCHEMES = ("http", "https")
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 #: One plaintext frame of the v1 transport is 65519 bytes and v1 has no
-#: fragmentation. `web_fetch` may locally return up to `MAX_BYTES_CEILING`, but
-#: a result bigger than a frame cannot be sent to core — see README "Frame
-#: ceiling". Kept as a documented constant so the limitation is visible to
-#: readers instead of being discovered in production.
+#: fragmentation, so a result bigger than a frame is a result core never sees.
+#: `MAX_RESULT_BYTES` is what keeps every `web_fetch` answer inside one frame
+#: with room for the JSON-RPC envelope; this constant is the ceiling it is
+#: derived from, documented here so the reason stays visible to readers.
 FRAME_PLAINTEXT_BYTES = 65_519
 
 _REQUEST_HEADERS = {
@@ -701,7 +713,7 @@ def _perform(
 
             if text_only:
                 # Refuse non-text before pulling the body: no reason to download
-                # a 256 KiB image just to throw it away.
+                # a 32 KiB image just to throw it away.
                 _require_text_type(headers)
 
             body, truncated = (b"", False)
@@ -731,12 +743,65 @@ def _content_length(headers: Message) -> int | None:
     return value if value >= 0 else None
 
 
+# ---------------------------------------------------------------- result budget
+
+
+def _result_json_size(result: dict[str, Any]) -> int:
+    """UTF-8 size of the result as JSON, metadata and all.
+
+    Measured with `json.dumps`' default separators (`", "`, `": "`), which are
+    never smaller than the compact form the transport emits: a result that fits
+    here fits on the wire.
+    """
+    return len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+
+def _fit_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Cut `text` until the whole result fits `MAX_RESULT_BYTES`.
+
+    `max_bytes` bounds the *body*; this bounds the *result*. The two are not the
+    same number: JSON escaping (`\\n`, quotes, control characters) and multibyte
+    text inflate the envelope, and the transport must carry the metadata too. A
+    caller asking for the largest allowed window therefore still gets a
+    sendable result — the surplus is trimmed here and reported as truncated.
+
+    The cut is a character count, chosen by binary search, so it can never land
+    inside a UTF-8 sequence. `bytes` keeps its meaning (body bytes the window
+    read); `text` may now be shorter than that.
+    """
+    budget = MAX_RESULT_BYTES
+    if _result_json_size(result) <= budget:
+        return result
+
+    text = result["text"]
+    body_truncated = bool(result["truncated"])
+    # Size grows monotonically with the prefix, so binary search finds the exact
+    # longest prefix that fits without guessing at the metadata overhead. The
+    # search runs with the final `truncated` value in place: "false" → "true" is
+    # itself a byte of the envelope.
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = {**result, "text": text[:middle], "truncated": True}
+        if _result_json_size(candidate) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+
+    if low == len(text) and not body_truncated:
+        # Only the spelling of the flag made room. Claiming `truncated` while
+        # returning the whole window would be a lie, so actually cut.
+        low = max(0, low - 1)
+
+    return {**result, "text": text[:low], "truncated": body_truncated or low < len(text)}
+
+
 # ------------------------------------------------------------------------ tools
 
 
 @tool(
     "web_fetch",
-    "抓取 http/https URL 的文本（仅 text/* 与 application/json）；拒绝内网地址，最多 3 次重定向，超过 max_bytes 截断",
+    "抓取 http/https URL 的文本（仅 text/* 与 application/json）；拒绝内网地址，最多 3 次重定向；超过 max_bytes 或结果预算 49152 字节截断",
     risk="medium",
     timeout_ms=35_000,
     idempotent=True,
@@ -748,14 +813,16 @@ def web_fetch(url: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, Any]:
         raise ToolFailure("INVALID_ARGUMENT", f"max_bytes must be within [1, {MAX_BYTES_CEILING}]")
 
     reply = _perform(url, method="GET", read_body=True, max_bytes=window, text_only=True)
-    return {
-        "status": reply.status,
-        "content_type": reply.content_type,
-        "text": _decode(reply.body, reply.headers),
-        "bytes": len(reply.body),
-        "truncated": reply.truncated,
-        "final_url": reply.final_url,
-    }
+    return _fit_result(
+        {
+            "status": reply.status,
+            "content_type": reply.content_type,
+            "text": _decode(reply.body, reply.headers),
+            "bytes": len(reply.body),
+            "truncated": reply.truncated,
+            "final_url": reply.final_url,
+        }
+    )
 
 
 @tool(
