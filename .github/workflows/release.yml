@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v0.0.2-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.0.2-alpha"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and publish ${{ inputs.tag || github.ref_name }}
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: "3.12"
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build backend
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Resolve and validate tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          case "$tag" in
+            v0.0.2-*) ;;
+            *) echo "::error::refusing to release: tag '$tag' does not match v0.0.2-*"; exit 1 ;;
+          esac
+          if ! git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+            echo "::error::tag '$tag' does not exist; create the tag yourself (this workflow never creates tags)"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          case "$tag" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build wheel and sdist
+        run: |
+          set -euo pipefail
+          rm -rf dist build
+          python -m build
+          ls -l dist
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          test -f manifest.json
+          python -c "import json; json.load(open('manifest.json'))"
+          python - <<'PY'
+          import glob
+          import sys
+          import tarfile
+          import zipfile
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          sdists = sorted(glob.glob("dist/*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"expected exactly 1 wheel and 1 sdist, got {wheels} / {sdists}")
+
+          wheel_names = zipfile.ZipFile(wheels[0]).namelist()
+          sdist_names = tarfile.open(sdists[0]).getnames()
+          print(f"{wheels[0]}: {len(wheel_names)} entries")
+          print(f"{sdists[0]}: {len(sdist_names)} entries")
+          if not any(n.endswith("manifest.json") for n in wheel_names):
+              print(
+                  "::warning title=manifest.json not in wheel::"
+                  "manifest.json is not packaged inside the wheel; "
+                  "it is attached to the Release as a standalone asset"
+              )
+          PY
+
+      - name: Check wheel version against tag
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import os
+          import re
+          import zipfile
+
+          tag = os.environ["RELEASE_TAG"]
+          with zipfile.ZipFile(glob.glob("dist/*.whl")[0]) as archive:
+              metadata = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+              text = archive.read(metadata).decode("utf-8")
+          version = re.search(r"^Version: (.+)$", text, re.MULTILINE).group(1).strip()
+          tag_version = tag.split("-", 1)[0].lstrip("v")
+          if version != tag_version:
+              print(
+                  f"::warning title=version mismatch::"
+                  f"wheel version {version} does not match tag {tag} ({tag_version})"
+              )
+          else:
+              print(f"wheel version {version} matches tag {tag}")
+          PY
+
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.whl ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            manifest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          draft: false
