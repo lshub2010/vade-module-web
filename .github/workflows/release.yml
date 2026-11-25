@@ -3,11 +3,11 @@ name: release
 on:
   push:
     tags:
-      - "v0.0.3-*"
+      - "v0.0.4-*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish, e.g. v0.0.3-alpha"
+        description: "Existing tag to build and publish, e.g. v0.0.4-alpha"
         required: true
         type: string
 
@@ -50,8 +50,8 @@ jobs:
           set -euo pipefail
           tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
           case "$tag" in
-            v0.0.3-*) ;;
-            *) echo "::error::refusing to release: tag '$tag' does not match v0.0.3-*"; exit 1 ;;
+            v0.0.4-*) ;;
+            *) echo "::error::refusing to release: tag '$tag' does not match v0.0.4-*"; exit 1 ;;
           esac
           if ! git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
             echo "::error::tag '$tag' does not exist; create the tag yourself (this workflow never creates tags)"
